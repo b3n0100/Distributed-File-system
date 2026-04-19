@@ -1,0 +1,210 @@
+import os
+import json
+import hashlib
+
+
+class DFS:
+    PAGE_SIZE = 4096
+
+    def __init__(self, chord):
+        self.chord = chord
+
+
+    def _hash_key(self, text):
+        
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        return int(digest, 16)
+
+    def _metadata_key(self, filename):
+        return self._hash_key("metadata:" + filename)
+
+    def _page_key(self, filename, page_no):
+        return self._hash_key(f"{filename}:{page_no}")
+
+    def _index_key(self):
+        return self._hash_key("dfs:index")
+
+
+    def _put_object(self, key, obj):
+        """
+        Stores a JSON string in Chord.
+        """
+        value = json.dumps(obj)
+        self.chord.put(key, value)
+
+    def _get_object(self, key):
+        """
+        Retrieves a JSON string from Chord and converts back to dict.
+        """
+        value = self.chord.get(key)
+        if value is None:
+            return None
+
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+
+        if isinstance(value, str):
+            return json.loads(value)
+
+        return value
+
+    def _delete_object(self, key):
+        self.chord.delete(key)
+
+    # DFS index helpers for ls()
+
+    def _get_index(self):
+        index = self._get_object(self._index_key())
+        if index is None:
+            return {"files": []}
+        return index
+
+    def _save_index(self, index):
+        self._put_object(self._index_key(), index)
+
+    def _add_to_index(self, filename):
+        index = self._get_index()
+        if filename not in index["files"]:
+            index["files"].append(filename)
+            index["files"].sort()
+            self._save_index(index)
+
+    def _remove_from_index(self, filename):
+        index = self._get_index()
+        if filename in index["files"]:
+            index["files"].remove(filename)
+            self._save_index(index)
+
+
+    # Metadata helpers
+
+
+    def _new_metadata(self, filename):
+        return {
+            "type": "metadata",
+            "filename": filename,
+            "size_bytes": 0,
+            "num_pages": 0,
+            "pages": [],
+            "version": 1
+        }
+
+    def _get_metadata(self, filename):
+        return self._get_object(self._metadata_key(filename))
+
+    def _save_metadata(self, metadata):
+        key = self._metadata_key(metadata["filename"])
+        self._put_object(key, metadata)
+
+
+    def touch(self, filename):
+        metadata = self._get_metadata(filename)
+        if metadata is not None:
+            return False
+
+        metadata = self._new_metadata(filename)
+        self._save_metadata(metadata)
+        self._add_to_index(filename)
+        return True
+
+    def append(self, filename, local_path):
+        metadata = self._get_metadata(filename)
+        if metadata is None:
+            raise FileNotFoundError(f"Distributed file '{filename}' does not exist.")
+
+        if not os.path.exists(local_path):
+            raise FileNotFoundError(f"Local file '{local_path}' does not exist.")
+
+        with open(local_path, "rb") as infile:
+            while True:
+                chunk = infile.read(self.PAGE_SIZE)
+                if not chunk:
+                    break
+
+                page_no = metadata["num_pages"]
+                page_key = self._page_key(filename, page_no)
+
+                page_obj = {
+                    "type": "page",
+                    "filename": filename,
+                    "page_no": page_no,
+                    "size": len(chunk),
+                    "data": chunk.decode("utf-8", errors="replace")
+                }
+
+                self._put_object(page_key, page_obj)
+
+                metadata["pages"].append({
+                    "page_no": page_no,
+                    "guid": page_key,
+                    "size": len(chunk)
+                })
+
+                metadata["num_pages"] += 1
+                metadata["size_bytes"] += len(chunk)
+
+        metadata["version"] += 1
+        self._save_metadata(metadata)
+        return True
+
+    def read(self, filename):
+        metadata = self._get_metadata(filename)
+        if metadata is None:
+            raise FileNotFoundError(f"Distributed file '{filename}' does not exist.")
+
+        contents = []
+
+        pages = sorted(metadata["pages"], key=lambda p: p["page_no"])
+        for page_desc in pages:
+            page_obj = self._get_object(page_desc["guid"])
+            if page_obj is None:
+                raise RuntimeError(
+                    f"Missing page {page_desc['page_no']} for file '{filename}'."
+                )
+            contents.append(page_obj["data"])
+
+        return "".join(contents)
+
+    def head(self, filename, n):
+        """
+        Returns the first n lines.
+        """
+        if n < 0:
+            raise ValueError("n must be nonnegative")
+
+        content = self.read(filename)
+        lines = content.splitlines()
+        return "\n".join(lines[:n])
+
+    def tail(self, filename, n):
+        """
+        Returns the last n lines.
+        """
+        if n < 0:
+            raise ValueError("n must be nonnegative")
+
+        content = self.read(filename)
+        lines = content.splitlines()
+        return "\n".join(lines[-n:])
+
+    def delete_file(self, filename):
+        metadata = self._get_metadata(filename)
+        if metadata is None:
+            return False
+
+        for page_desc in metadata["pages"]:
+            self._delete_object(page_desc["guid"])
+
+        self._delete_object(self._metadata_key(filename))
+        self._remove_from_index(filename)
+        return True
+
+    def ls(self):
+        index = self._get_index()
+        return index["files"]
+
+    def stat(self, filename):
+        metadata = self._get_metadata(filename)
+        if metadata is None:
+            raise FileNotFoundError(f"Distributed file '{filename}' does not exist.")
+        return metadata
