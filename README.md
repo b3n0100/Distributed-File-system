@@ -27,8 +27,8 @@ The implementation is intentionally small and demo-friendly. It is designed to s
 Install:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python -m venv venv
+venv\Scripts\Activate
 pip install Pyro5
 ```
 
