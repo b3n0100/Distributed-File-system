@@ -1,5 +1,8 @@
 
 ## Terminal 10 Output
+
+Test evidence: 
+##
 === touch ===
 [leader] COMMIT slot=1 ballot=1 op=put key=metadata:hello.txt
 [leader] COMMIT slot=2 ballot=2 op=put key=dfs:index
