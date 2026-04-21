@@ -1,8 +1,23 @@
 
 ## Terminal 10 Output
 
-Test evidence: 
-##
+##Address:
+
+Chord integration
+
+metadata and page design
+
+distributed sorting strategy
+
+replication strategy
+
+Paxos message flow
+
+failure assumptions
+
+limitations and future improvements
+
+##Test evidence: 
 === touch ===
 [leader] COMMIT slot=1 ballot=1 op=put key=metadata:hello.txt
 [leader] COMMIT slot=2 ballot=2 op=put key=dfs:index
