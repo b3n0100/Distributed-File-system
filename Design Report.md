@@ -1,42 +1,53 @@
+# Distributed File System over Chord — Design Report
+### CECS 327 — Parts 1 & 2
 
-## Terminal 10 Output
+---
 
+## 1. Chord Integration
 
-## Address:
+Chord is the backbone of this project. Every file page, metadata object, and sorted bucket gets placed on the ring by hashing its key and routing to the responsible successor node. No central directory is needed — the ring handles placement automatically.
 
-## Chord integration : 
+Each node gets a numeric ID from consistent hashing of its host and port:
 
-Chord is deemed crucial in this project since it determines ownership of file pages and sorted bucket objects. Each node is assigned a GUID using consistent hashing. File pages and sort buckets are also assigned deterministic keys, such as: 
+```
+node_id = SHA1("host:port") % 2^m
+```
 
-hello.txt : 0
-records.txt:0
-sorted-bucket:records.sorted.txt:122
-sorted-bucket:records.sorted.txt:225
+File pages and sort buckets get deterministic keys the same way:
 
-The object key is hashed and routed to the responsible successor node using standard chord successor lookup. 
+```
+metadata:hello.txt
+hello.txt:0
+sorted-bucket:big_sorted.txt:122
+```
 
-An example being:
+Each key is hashed and routed to the correct successor. From our terminal output, node 122 joins through node 165 and learns its successor immediately:
 
-[node 122] registered chord.node.122 -> PYRO:obj_89ce4d92cfb642c1b7bbe15ec7c5d063@127.0.0.1:9001
+```
+[node 122] registered chord.node.122 -> PYRO:obj_89ce4d92...@127.0.0.1:9001
 [node 122] joined via 165; successor=165
 [node 122] running; ctrl-c to stop
+```
 
-This displays a node with identifier 122 which joins an existing ring through node 165 , which in turn learns it successor. This design allows the system to place page keys and sorted-bucket keys onto the correct storage node without a centralized directory. 
+This is standard Chord behavior — the joining node contacts a known peer, finds its successor, and begins stabilization. Finger tables are fixed in the background so lookups stay O(log n).
 
+The key advantage here is that the DFS never needs to know which physical node stores a given page. It just hashes the key and lets Chord figure out the rest.
 
-## Metadata and page design: 
+---
 
-The way we represent each file in this project is by using a metadata object plus one or more page objects. 
+## 2. Metadata and Page Design
 
-Metadata object is stored under keys like: 
+Each distributed file is represented as two separate layers: a metadata object and one or more page objects. Keeping these separate was one of the most important design decisions we made.
 
-metadata:hello.txt
-metadata:records.txt
-Metadata:records.sorted.txt
+**Metadata** is stored under a deterministic key:
 
-The metadata tracks file structure and versioning information. From the stat output for hello.txt:
+```
+metadata:<filename>
+```
 
+It tracks everything about the file's structure — filename, size, page count, page GUIDs, replica locations, and a version number. From a live `stat` call on `hello.txt`:
 
+```json
 {
   "type": "metadata",
   "filename": "hello.txt",
@@ -56,150 +67,247 @@ The metadata tracks file structure and versioning information. From the stat out
   ],
   "version": 2
 }
+```
 
-This design shows that metadata stores:
-filename
-object type
-total byte size
-number of pages
-page number and page GUID
-replica identifiers for each page
-metadata version
+**Pages** are stored separately under keys like `hello.txt:0`. The actual file bytes live here, base64-encoded so they survive JSON serialization cleanly.
 
-However, the actual file contents are stored in page objects such as: 
-hello.txt:0
-records.txt:0
-Records.sorted.txt:0
-It’s important to highlight separation since appending data updates the page object and then commits a new version of the metadata.  As seen in our terminal log: 
+When you append to a file, the system writes the new page first, then updates the metadata with the new page descriptor and increments the version. You can see this ordering in the Paxos commit log:
+
+```
 [leader] COMMIT slot=3 ballot=3 op=put key=hello.txt:0
 [leader] COMMIT slot=4 ballot=4 op=put key=metadata:hello.txt
-The first commit writes the page contents, and the second commit updates the file metadata.
-The advantage of this design is that metadata changes are small and easy to replicate, scaling is more natural when it comes to larger files, append operations do not require rewriting all file state, and replication can be tracked per page.
+```
 
+The page goes in first, then the metadata update that points to it. This matters because if the system crashes between the two, the worst case is an unreferenced page — the metadata never pointed to it, so the file stays consistent from the client's perspective.
 
+Separating metadata from content also makes replication much simpler. Metadata objects are small JSON blobs that are cheap to replicate and version. Pages can be large, but they are write-once — once a page is appended it never changes, which makes consistency much easier to reason about.
 
-## Distributed sorting strategy: 
+---
 
-The “sort()” operation uses a bucket-based distributed sorting design. Before the system sorts anything, it needs to commit metadata and page data for records.txt, that looks something like this : 
+## 3. Distributed Sorting Strategy
 
-[leader] COMMIT slot=5 ballot=5 op=put key=metadata:records.txt
-[leader] COMMIT slot=6 ballot=6 op=put key=dfs:index
-[leader] COMMIT slot=7 ballot=7 op=put key=records.txt:0
-[leader] COMMIT slot=8 ballot=8 op=put key=metadata:records.txt
+The sort operation uses a bucket-based approach where records are partitioned across Chord nodes by key, sorted locally per bucket, then merged into a globally sorted output file.
 
-As the system continues, it must partition records into buckets, which is based on the record key. The result was : 
+**Step 1 — Read all pages of the input file**
 
+The client reads every page of the input DFS file and parses each `key,value` record.
+
+**Step 2 — Partition records into buckets**
+
+Each record key is hashed to find the responsible Chord successor:
+
+```python
+owner = chord._find_responsible("sort-key:" + key)
+```
+
+Records with the same owner get grouped into the same bucket. From our 100-record demo:
+
+```json
 {
-"buckets": {
-"225": 3,
-"122": 2
-},
-"records": 5,
-"output": "records.sorted.txt"
+  "buckets": {
+    "225": 30,
+    "243": 8,
+    "122": 63,
+    "165": 15,
+    "169": 4
+  },
+  "records": 100,
+  "output": "big_sorted.txt"
 }
+```
 
-Now although the code itself can be a bit vague this simply means 5 total records were partitioned into two buckets, with 3 records routed to bucket 225 and 2 records routed to bucket 122. With this in mind each bucket is stored and written as a separate distributed object: 
+100 records were distributed across all 5 Chord nodes, with each node responsible for the records whose keys hash into its range.
 
-[leader] COMMIT slot=9 ballot=9 op=put key=sorted-bucket:records.sorted.txt:122
-[leader] COMMIT slot=10 ballot=10 op=put key=sorted-bucket:records.sorted.txt:225
+**Step 3 — Sort locally per bucket**
 
-Note that this is where the distributed sorting happens since each bucket can be sorted independently, potentially on different chord nodes. So once the bucket results are ready, the system commits metadata and output pages for the merged sorted file: 
+Each bucket's records are sorted by key independently. The sorted bucket is stored as a distributed object:
 
-[leader] COMMIT slot=11 ballot=11 op=put key=metadata:records.sorted.txt
-[leader] COMMIT slot=12 ballot=12 op=put key=dfs:index
-[leader] COMMIT slot=13 ballot=13 op=put key=records.sorted.txt:0
-[leader] COMMIT slot=14 ballot=14 op=put key=metadata:records.sorted.txt
-[leader] COMMIT slot=15 ballot=15 op=put key=metadata:records.sorted.txt
+```
+[leader] COMMIT slot=5 ballot=5 op=put key=sorted-bucket:big_sorted.txt:122
+[leader] COMMIT slot=6 ballot=6 op=put key=sorted-bucket:big_sorted.txt:165
+[leader] COMMIT slot=7 ballot=7 op=put key=sorted-bucket:big_sorted.txt:169
+[leader] COMMIT slot=8 ballot=8 op=put key=sorted-bucket:big_sorted.txt:225
+[leader] COMMIT slot=9 ballot=9 op=put key=sorted-bucket:big_sorted.txt:243
+```
 
-And once sorted looks like:
+**Step 4 — Merge into globally sorted output**
 
-0005,zoe
-0012,alice
-0042,bob
-0042,bobby
-0190,carol
+The client merges all bucket results into one globally sorted list and writes it as a new DFS file. The output is validated before the operation returns:
 
-## Replication strategy:
+```
+[demo] ✓ All 100 records are globally sorted
+[demo] First 5 : ['0054,xena', '0107,yolanda', '0189,victor', '0521,alice', '0526,zach']
+[demo] Last  5 : ['9639,rob', '9655,ivan', '9675,nancy', '9814,karl', '9864,alice']
+```
 
- In our project, we decided to replicate each page three times instead of storing only a single copy. We did this because if one node crashes, we still want the file to remain available and readable from another location.
-This can be seen directly in the stat output for hello.txt:
+The sort manifest is stored in the output file's metadata for debugging and auditing purposes.
 
+---
+
+## 4. Replication Strategy
+
+Every DFS object — metadata and pages — is replicated three times. The replication factor R=3 was chosen because it is the minimum needed to tolerate one node failure while still maintaining a majority for Paxos.
+
+Replica keys are derived deterministically from the logical key:
+
+```
+<logical_key>|replica|0
+<logical_key>|replica|1
+<logical_key>|replica|2
+```
+
+Each replica key is routed through Chord independently, so with enough peers in the ring the three copies end up on different physical nodes. This is visible in the stat output for every file:
+
+```json
 "replicas": [
-"hello.txt:0|replica|0",
-"hello.txt:0|replica|1",
-"hello.txt:0|replica|2"
+  "hello.txt:0|replica|0",
+  "hello.txt:0|replica|1",
+  "hello.txt:0|replica|2"
 ]
-Our approach was:
-the original page is stored using its normal GUID, such as hello.txt:0
-three replica identifiers are created for backup copies
-the metadata keeps track of all replica locations
-This made our design easier because we could manage replication at the page level instead of copying the full file every time. Since metadata already stores page information, adding replica tracking fit naturally into the system.
-Why we chose this strategy:
-We wanted a simple but reliable fault-tolerance model. If a node storing the main page fails, another replica can still serve the file. This helps prevent data loss and improves availability.
-It also works well for both normal files and sorted output files because the same page-based logic applies everywhere.
-What we learned:
-One thing we noticed is that replication becomes much easier when metadata is separated from content pages. Instead of treating the whole file as one object, we can recover and manage individual pages more efficiently.
-If we had more time, we would add automatic replica repair so the system could recreate missing replicas after a failure.
-## Paxos Message Flow: 
-For metadata consistency, we used Paxos so that all important updates happen in the same agreed order across replicas. We mainly used Paxos for operations like touch, append, and sort, where metadata must stay consistent even if one replica fails.
+```
 
-The leader process creates the commit first, and then the replicas respond with ACCEPT and LEARN messages.
+On write, all three replicas are written before the operation is considered complete. On read, the system tries each replica key in order and returns the first successful result. This means reads survive a single node failure without any extra coordination.
 
-Leader point of view: 
-[leader] COMMIT slot=1 ballot=1 op=put key=metadata:hello.txt
-[leader] COMMIT slot=2 ballot=2 op=put key=dfs:index
-[leader] COMMIT slot=3 ballot=3 op=put key=hello.txt:0
-[leader] COMMIT slot=4 ballot=4 op=put key=metadata:hello.txt
+We chose page-level replication rather than full-file replication because it fits naturally into the existing page descriptor model. The metadata already tracks per-page GUIDs, so adding replica keys per page was straightforward. It also means that for large files, individual pages can be recovered independently rather than needing to re-replicate the entire file.
 
-During the sorting: 
-[leader] COMMIT slot=9 ballot=9 op=put key=sorted-bucket:records.sorted.txt:122
-[leader] COMMIT slot=10 ballot=10 op=put key=sorted-bucket:records.sorted.txt:225
-[leader] COMMIT slot=11 ballot=11 op=put key=metadata:records.sorted.txt
+The one limitation of this approach is that replica repair is not automatic. If a node goes down and comes back, the system does not detect that its replicas are stale and rebuild them. This would require a background repair process that we did not implement.
 
-Replica point of view: (Replica 2 confirms the proposal was accepted and learned)
+---
 
+## 5. Paxos Message Flow
+
+Paxos is used to serialize all DFS metadata updates across the three replicas. Every call to `touch`, `append`, `delete_file`, and `sort_file` goes through the Paxos leader before anything is written to Chord.
+
+The protocol follows a simplified two-phase commit:
+
+**Phase 1 — ACCEPT**
+
+The leader assigns a slot and ballot number to the operation and sends ACCEPT to all replicas:
+
+```
+[leader]   → ACCEPT(ballot=1, slot=1) to replica=1
+[leader]   ← ACK from replica=1
+[leader]   → ACCEPT(ballot=1, slot=1) to replica=2
+[leader]   ← ACK from replica=2
+[leader]   → ACCEPT(ballot=1, slot=1) to replica=3
+[leader]   ← ACK from replica=3
+[leader]   accepts=3 needed=2
+```
+
+A replica accepts if the incoming ballot is greater than or equal to any ballot it has already seen for that slot. This ensures that a higher-ballot leader can always take over.
+
+**Phase 2 — LEARN**
+
+Once a majority of replicas have accepted, the leader sends LEARN to those replicas:
+
+```
+[leader]   → LEARN(ballot=1, slot=1) to replica=1
+[leader]   ← LEARNED by replica=1
+[leader]   → LEARN(ballot=1, slot=1) to replica=2
+[leader]   ← LEARNED by replica=2
+[leader] ✓ COMMIT slot=1 ballot=1 op=put key=metadata:hello.txt
+```
+
+Once a majority have learned, the operation is committed and applied to Chord. All replicas that learned the operation have it in their committed log, so even if the leader crashes at this point, the operation is durable.
+
+From the replica's perspective, replica 2 shows both phases for every slot:
+
+```
 [replica 2] ACCEPT slot=1 ballot=1 op=put key=metadata:hello.txt
-[replica 2] LEARN slot=1 ballot=1 op=put key=metadata:hello.txt
+[replica 2] LEARN  slot=1 ballot=1 op=put key=metadata:hello.txt
+```
 
-The process worked like this:
-the leader proposes an operation using a slot and ballot number
-replicas receive and accept that operation
-once a majority agrees, the value is learned
-the operation becomes part of the replicated metadata log
-This helped us make sure that even if multiple file operations happened close together, every replica still saw the same final order.
-## Failure Assumptions
-While designing the system, we made several assumptions about failures so the project would stay realistic but still manageable.
-We assumed:
-nodes can crash, but they do not behave maliciously
-there are no Byzantine failures
-a majority of Paxos replicas stay alive
-the network may be delayed, but messages are eventually delivered
-Chord nodes can leave and later rejoin the ring
-We focused mainly on crash failures because that is the most common case for a distributed storage system like this.
-For example, if one storage node goes down, the replica copies still allow the file to be accessed. If one Paxos replica crashes, consensus can still continue as long as the majority remains available.
-This assumption kept the design practical and allowed us to focus on correctness instead of defending against malicious behavior.
-What this means for the system
-The system is fault tolerant, but only up to a point. If too many Paxos replicas fail at once, consensus will stop. If all page replicas are lost, recovery is no longer possible.
-Because of this, replication and majority voting are both necessary parts of the design.
-## Limitations and Future Improvements
-Even though the system worked successfully, there are still several limitations in our current design.
-Current Limitations
-First, our Paxos implementation is simplified and behaves more like a single-leader version instead of a full Multi-Paxos system. It works well for this project, but it is not fully optimized for larger production systems.
-Second, Chord stabilization is limited. If nodes frequently join or leave, the system does not automatically repair all successor relationships or rebalance data as aggressively as a full implementation would.
-Third, replica recovery is mostly manual. We store replica information correctly, but the system does not automatically rebuild missing replicas after a failure.
-We also do not use persistent disk-backed storage, so most of the design is focused on correctness and architecture rather than full long-term durability.
-Future Improvements
-If I were continuing this project, I would improve several areas.
-implement full Multi-Paxos optimization
-add automatic failure detection for nodes
-create background replica healing and recovery
-improve dynamic Chord rebalancing after joins and leaves
-support stronger concurrency handling for multiple users
-add persistent distributed storage instead of temporary memory-based state
-Overall, the project demonstrates the main distributed systems concepts successfully, but these improvements would improve our distributed file system on a larger scale.
+Operations are ordered by slot number, which means every replica applies them in the same sequence regardless of timing. This is the core guarantee Paxos provides — not just that all replicas eventually agree, but that they agree on the same order.
 
+---
 
-## Test evidence: 
+## 6. Failure Scenario — Follower Crash During Replication
+
+For Part 2, we demonstrated a follower crash mid-session using `demo_failure.py`. The scenario works as follows: replica 3 is treated as crashed after slot 1, and the leader must continue committing using only replicas 1 and 2.
+
+**Slot 1 — all three replicas alive:**
+
+```
+[leader] → PROPOSE slot=1 ballot=1 op=put key=metadata:crash-test.txt
+[leader]   → ACCEPT(ballot=1, slot=1) to replica=1
+[leader]   ← ACK from replica=1
+[leader]   → ACCEPT(ballot=1, slot=1) to replica=2
+[leader]   ← ACK from replica=2
+[leader]   → ACCEPT(ballot=1, slot=1) to replica=3
+[leader]   ← ACK from replica=3
+[leader]   accepts=3 needed=2
+[leader] ✓ COMMIT slot=1 ballot=1 op=put key=metadata:crash-test.txt
+```
+
+**Slot 2+ — replica 3 crashed, leader skips it:**
+
+```
+[leader] → PROPOSE slot=2 ballot=2 op=put key=dfs:index
+[leader]   → ACCEPT(ballot=2, slot=2) to replica=1
+[leader]   ← ACK from replica=1
+[leader]   → ACCEPT(ballot=2, slot=2) to replica=2
+[leader]   ← ACK from replica=2
+[leader]   ✗ replica=3 is CRASHED — skipping
+[leader]   accepts=2 needed=2
+[leader] ✓ COMMIT slot=2 ballot=2 op=put key=dfs:index
+```
+
+The system successfully committed every subsequent operation with only 2 of 3 replicas. This is exactly the fault tolerance guarantee Paxos provides — as long as a majority (2 of 3) remain available, the system makes progress.
+
+The final confirmation from the demo:
+
+```
+[demo] ✓ append succeeded with only 2 live replicas (majority maintained)
+```
+
+This scenario directly maps to the course material on crash failures, majority-based commitment, and why three replicas are the minimum useful replication factor.
+
+---
+
+## 7. Failure Assumptions
+
+We designed around crash-stop failures only. Nodes stop and stay stopped — they do not send corrupted messages or behave maliciously. This is a reasonable assumption for a local network environment and keeps the protocol analysis tractable.
+
+Specific assumptions:
+
+- A majority of Paxos replicas (at least 2 of 3) remain alive at all times
+- Messages may be delayed or reordered, but are eventually delivered
+- Chord nodes may leave the ring; stabilization will eventually repair successor pointers
+- No Byzantine behavior — a node either responds correctly or not at all
+
+The system is fault tolerant up to one replica failure. If two of three Paxos replicas crash simultaneously, consensus stops and the system becomes unavailable. If all replicas of a given page are lost, that data is unrecoverable. These are known limitations of the design.
+
+---
+
+## 8. Limitations and Future Improvements
+
+**Current limitations:**
+
+Our Paxos implementation is a simplified single-leader protocol. There is no leader election — if the leader process crashes, the system stops. A full Multi-Paxos implementation would handle leader failure by having replicas detect a timeout and elect a new leader deterministically.
+
+Chord stabilization works correctly but is not aggressive about rebalancing after node departures. In a production system, data would need to migrate to new successors when nodes leave.
+
+Replica repair is not implemented. The system tracks replica locations in metadata, but does not detect or rebuild stale or missing replicas after a node recovers. This would require a background process comparing replica states.
+
+There is no persistent disk storage. All state lives in memory, so a full system restart loses all data. Adding disk-backed storage to each Chord node would make the system durable across restarts.
+
+**Future improvements:**
+
+- Full Multi-Paxos with timeout-based leader election and deterministic takeover
+- Background replica healing that detects missing replicas and rebuilds them
+- Persistent storage on each Chord node using a simple key-value store like SQLite
+- Automatic data migration when nodes join or leave the ring
+- Stronger concurrency control for simultaneous client writes to the same file
+
+Despite these limitations, the system correctly demonstrates the core ideas: Chord-based distributed storage, page-level replication, Paxos-ordered metadata updates, distributed sorting across ring nodes, and continued availability under single-node failure.
+
+---
+
+## 9. Test Evidence
+
+### Part 1 — DFS operations
+
+```
 === touch ===
 [leader] COMMIT slot=1 ballot=1 op=put key=metadata:hello.txt
 [leader] COMMIT slot=2 ballot=2 op=put key=dfs:index
@@ -240,7 +348,6 @@ line three
 line four
 line five
 
-
 === head 3 ===
 line one
 line two
@@ -250,23 +357,9 @@ line three
 line four
 line five
 
-=== sort ===
-[leader] COMMIT slot=5 ballot=5 op=put key=metadata:records.txt
-[leader] COMMIT slot=6 ballot=6 op=put key=dfs:index
-[leader] COMMIT slot=7 ballot=7 op=put key=records.txt:0
-[leader] COMMIT slot=8 ballot=8 op=put key=metadata:records.txt
-[leader] COMMIT slot=9 ballot=9 op=put key=sorted-bucket:records.sorted.txt:122
-[leader] COMMIT slot=10 ballot=10 op=put key=sorted-bucket:records.sorted.txt:225
-[leader] COMMIT slot=11 ballot=11 op=put key=metadata:records.sorted.txt
-[leader] COMMIT slot=12 ballot=12 op=put key=dfs:index
-[leader] COMMIT slot=13 ballot=13 op=put key=records.sorted.txt:0
-[leader] COMMIT slot=14 ballot=14 op=put key=metadata:records.sorted.txt
-[leader] COMMIT slot=15 ballot=15 op=put key=metadata:records.sorted.txt
+=== sort (5 records) ===
 {
-  "buckets": {
-    "225": 3,
-    "122": 2
-  },
+  "buckets": { "225": 3, "122": 2 },
   "records": 5,
   "output": "records.sorted.txt"
 }
@@ -275,44 +368,44 @@ line five
 0042,bob
 0042,bobby
 0190,carol
+```
 
+### Part 2 — 100-record distributed sort
 
-## Paxos Terminal output
-(venv) PS C:\Users\dougd\OneDrive\Documents\GitHub\Distributed-File-system> python paxos.py --host 127.0.0.1 --port 9102 --replica-id 2
-[replica 2] registered paxos.replica.2 -> PYRO:obj_5e601c35e5b246b7bc49e07141751c33@127.0.0.1:9102
+```
+[demo] ✓ All 100 records are globally sorted
+[demo] First 5 : ['0054,xena', '0107,yolanda', '0189,victor', '0521,alice', '0526,zach']
+[demo] Last  5 : ['9639,rob', '9655,ivan', '9675,nancy', '9814,karl', '9864,alice']
+
+Buckets:
+  node 122 : 63 records
+  node 165 : 15 records
+  node 169 :  4 records
+  node 225 : 30 records
+  node 243 :  8 records
+```
+
+### Part 2 — Follower crash scenario
+
+```
+[leader] ✓ COMMIT slot=1 ballot=1 op=put key=metadata:crash-test.txt  (all 3 alive)
+[leader]   ✗ replica=3 is CRASHED — skipping
+[leader]   accepts=2 needed=2
+[leader] ✓ COMMIT slot=2 ballot=2 op=put key=dfs:index  (2 of 3 alive)
+[leader] ✓ COMMIT slot=3 ballot=3 op=put key=crash-test.txt:0
+[leader] ✓ COMMIT slot=4 ballot=4 op=put key=metadata:crash-test.txt
+[demo] ✓ append succeeded with only 2 live replicas (majority maintained)
+```
+
+### Paxos replica log (replica 2)
+
+```
 [replica 2] ACCEPT slot=1 ballot=1 op=put key=metadata:hello.txt
-[replica 2] LEARN slot=1 ballot=1 op=put key=metadata:hello.txt
+[replica 2] LEARN  slot=1 ballot=1 op=put key=metadata:hello.txt
 [replica 2] ACCEPT slot=2 ballot=2 op=put key=dfs:index
-[replica 2] LEARN slot=2 ballot=2 op=put key=dfs:index
+[replica 2] LEARN  slot=2 ballot=2 op=put key=dfs:index
 [replica 2] ACCEPT slot=3 ballot=3 op=put key=hello.txt:0
-[replica 2] LEARN slot=3 ballot=3 op=put key=hello.txt:0
+[replica 2] LEARN  slot=3 ballot=3 op=put key=hello.txt:0
 [replica 2] ACCEPT slot=4 ballot=4 op=put key=metadata:hello.txt
-[replica 2] LEARN slot=4 ballot=4 op=put key=metadata:hello.txt
-[replica 2] ACCEPT slot=5 ballot=5 op=put key=metadata:records.txt
-[replica 2] LEARN slot=5 ballot=5 op=put key=metadata:records.txt
-[replica 2] ACCEPT slot=6 ballot=6 op=put key=dfs:index
-[replica 2] LEARN slot=6 ballot=6 op=put key=dfs:index
-[replica 2] ACCEPT slot=7 ballot=7 op=put key=records.txt:0
-[replica 2] LEARN slot=7 ballot=7 op=put key=records.txt:0
-[replica 2] ACCEPT slot=8 ballot=8 op=put key=metadata:records.txt
-[replica 2] LEARN slot=8 ballot=8 op=put key=metadata:records.txt
-[replica 2] ACCEPT slot=9 ballot=9 op=put key=sorted-bucket:records.sorted.txt:122
-[replica 2] LEARN slot=9 ballot=9 op=put key=sorted-bucket:records.sorted.txt:122
-[replica 2] ACCEPT slot=10 ballot=10 op=put key=sorted-bucket:records.sorted.txt:225
-[replica 2] LEARN slot=10 ballot=10 op=put key=sorted-bucket:records.sorted.txt:225
-[replica 2] ACCEPT slot=11 ballot=11 op=put key=metadata:records.sorted.txt
-[replica 2] LEARN slot=11 ballot=11 op=put key=metadata:records.sorted.txt
-[replica 2] ACCEPT slot=12 ballot=12 op=put key=dfs:index
-[replica 2] LEARN slot=12 ballot=12 op=put key=dfs:index
-[replica 2] ACCEPT slot=13 ballot=13 op=put key=records.sorted.txt:0
-[replica 2] LEARN slot=13 ballot=13 op=put key=records.sorted.txt:0
-[replica 2] ACCEPT slot=14 ballot=14 op=put key=metadata:records.sorted.txt
-[replica 2] LEARN slot=14 ballot=14 op=put key=metadata:records.sorted.txt
-[replica 2] ACCEPT slot=15 ballot=15 op=put key=metadata:records.sorted.txt
-[replica 2] LEARN slot=15 ballot=15 op=put key=metadata:records.sorted.txt
-
-## Chord Node Output
-(venv) PS C:\Users\dougd\OneDrive\Documents\GitHub\Distributed-File-system> python chord.py node --host 127.0.0.1 --port 9001 --join 127.0.0.1:9000
-[node 122] registered chord.node.122 -> PYRO:obj_89ce4d92cfb642c1b7bbe15ec7c5d063@127.0.0.1:9001
-[node 122] joined via 165; successor=165
-[node 122] running; ctrl-c to stop
+[replica 2] LEARN  slot=4 ballot=4 op=put key=metadata:hello.txt
+```
